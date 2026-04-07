@@ -1,1 +1,341 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import csv
+import random
+import sqlite3
+from collections import defaultdict
+from datetime import date, timedelta
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "retail_portfolio.db"
+SEED = 42
+
+TARGET_SALES_CENTS = 45_600_000
+TARGET_PROFIT_CENTS = 13_680_000
+TARGET_UNITS = 2_514
+ORDER_COUNT = 420
+
+
+FIRST_NAMES = [
+    "Aaliyah", "Noah", "Mia", "Liam", "Emma", "James", "Olivia", "Elijah", "Sophia",
+    "Lucas", "Ava", "Benjamin", "Isabella", "Mason", "Charlotte", "Logan", "Amelia",
+    "Henry", "Harper", "Ethan", "Aria", "Daniel", "Layla", "Jackson", "Ella", "Sebastian",
+    "Scarlett", "Levi", "Grace", "Julian", "Zoey", "Owen", "Nora", "Carter", "Riley",
+    "Wyatt", "Lily", "Gabriel", "Chloe", "Mateo", "Hannah", "Isaac", "Hazel", "Nathan",
+    "Penelope", "Samuel", "Aurora", "Anthony", "Victoria", "David", "Stella", "Joseph",
+    "Addison", "Andrew", "Lucy", "Christopher", "Paisley", "Joshua", "Claire", "Dylan",
+    "Naomi", "Caleb", "Maya", "Isaiah", "Elena", "Ryan", "Sarah", "Thomas", "Bella",
+    "Charles", "Madison", "Leo", "Ruby", "Asher", "Eva"
+]
+
+LAST_NAMES = [
+    "Carter", "Bennett", "Robinson", "Foster", "Hayes", "Brooks", "Jenkins", "Price",
+    "Perry", "Simmons", "Ramirez", "Ward", "Cooper", "Diaz", "Reed", "Cook", "Kelly",
+    "Morales", "Turner", "Parker", "Collins", "Edwards", "Stewart", "Morris", "Murphy",
+    "Rogers", "Bailey", "Rivera", "Howard", "Ross", "Gray", "James", "Watson", "Bell",
+    "Wood", "Baker", "Gonzalez", "Nelson", "Cox", "Ward", "Richardson", "Powell"
+]
+
+CITY_REGION_DATA = [
+    ("New York", "NY", "Northeast"),
+    ("Boston", "MA", "Northeast"),
+    ("Philadelphia", "PA", "Northeast"),
+    ("Buffalo", "NY", "Northeast"),
+    ("Pittsburgh", "PA", "Northeast"),
+    ("Chicago", "IL", "Midwest"),
+    ("Detroit", "MI", "Midwest"),
+    ("Columbus", "OH", "Midwest"),
+    ("Indianapolis", "IN", "Midwest"),
+    ("Milwaukee", "WI", "Midwest"),
+    ("Atlanta", "GA", "South"),
+    ("Charlotte", "NC", "South"),
+    ("Nashville", "TN", "South"),
+    ("Dallas", "TX", "South"),
+    ("Austin", "TX", "South"),
+    ("Miami", "FL", "South"),
+    ("Houston", "TX", "South"),
+    ("Los Angeles", "CA", "West"),
+    ("San Diego", "CA", "West"),
+    ("Seattle", "WA", "West"),
+    ("Phoenix", "AZ", "West"),
+    ("Denver", "CO", "West"),
+    ("Portland", "OR", "West"),
+    ("Las Vegas", "NV", "West"),
+]
+
+
+PRODUCTS = [
+    ("P001", "Electronics", "Laptops", "ApexBook 14", 1299.00),
+    ("P002", "Electronics", "Monitors", "VisionPro 27 Monitor", 389.00),
+    ("P003", "Electronics", "Accessories", "Pulse Wireless Mouse", 49.00),
+    ("P004", "Electronics", "Accessories", "Core Mechanical Keyboard", 119.00),
+    ("P005", "Furniture", "Desks", "Elevate Standing Desk", 699.00),
+    ("P006", "Furniture", "Chairs", "ErgoFlex Chair", 329.00),
+    ("P007", "Furniture", "Storage", "Summit Filing Cabinet", 219.00),
+    ("P008", "Furniture", "Tables", "Studio Collaboration Table", 559.00),
+    ("P009", "Office Supplies", "Paper", "BrightCopy Paper Pack", 14.00),
+    ("P010", "Office Supplies", "Writing", "ProGel Pen Set", 22.00),
+    ("P011", "Office Supplies", "Organization", "TaskMaster Planner", 18.00),
+    ("P012", "Office Supplies", "Technology", "DeskHub USB Dock", 149.00),
+    ("P013", "Home & Kitchen", "Appliances", "BrewMate Coffee Station", 249.00),
+    ("P014", "Home & Kitchen", "Storage", "FreshSeal Container Set", 39.00),
+    ("P015", "Home & Kitchen", "Decor", "Lumen Desk Lamp", 79.00),
+    ("P016", "Home & Kitchen", "Wellness", "PureAir Mini Purifier", 189.00),
+]
+
+
+CHANNELS = ["Online", "Retail Store", "Wholesale"]
+PAYMENT_METHODS = ["Credit Card", "Debit Card", "PayPal", "Invoice"]
+
+
+def generate_customers(total_customers: int = 72) -> list[tuple[str, str, str, str, str, str, str]]:
+    customers = []
+    segments = ["Consumer", "Corporate", "Home Office"]
+    tiers = ["Bronze", "Silver", "Gold"]
+
+    for idx in range(total_customers):
+        first = FIRST_NAMES[idx % len(FIRST_NAMES)]
+        last = LAST_NAMES[(idx * 5) % len(LAST_NAMES)]
+        city, state, region = CITY_REGION_DATA[idx % len(CITY_REGION_DATA)]
+        segment = segments[idx % len(segments)]
+        tier = tiers[(idx * 2) % len(tiers)]
+        customers.append(
+            (
+                f"C{idx + 1:03d}",
+                f"{first} {last}",
+                city,
+                state,
+                region,
+                segment,
+                tier,
+            )
+        )
+
+    return customers
+
+
+def allocate_total(total: int, weights: list[float], minimum: int = 1) -> list[int]:
+    raw = [w / sum(weights) * total for w in weights]
+    values = [max(minimum, int(x)) for x in raw]
+    delta = total - sum(values)
+
+    order = sorted(
+        range(len(values)),
+        key=lambda i: raw[i] - values[i],
+        reverse=delta > 0,
+    )
+
+    idx = 0
+    while delta != 0:
+        current = order[idx % len(order)]
+        if delta > 0:
+            values[current] += 1
+            delta -= 1
+        elif values[current] > minimum:
+            values[current] -= 1
+            delta += 1
+        idx += 1
+
+    return values
+
+
+def date_for_order(index: int) -> date:
+    start = date(2023, 1, 1)
+    end = date(2024, 12, 31)
+    span = (end - start).days
+    seasonal_bias = int((index / ORDER_COUNT) * span)
+    wobble = (index * 17) % 29
+    return start + timedelta(days=min(span, seasonal_bias + wobble))
+
+
+def export_csv(path: Path, rows: list[tuple], headers: list[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+def main() -> None:
+    random.seed(SEED)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+
+    customer_rows = generate_customers()
+    product_rows = PRODUCTS
+    customer_pool = []
+
+    for idx, customer in enumerate(customer_rows):
+        weight = 6 if idx < 18 else 3 if idx < 42 else 1
+        customer_pool.extend([customer] * weight)
+
+    orders: list[tuple] = []
+    line_blueprints: list[dict] = []
+
+    for order_num in range(1, ORDER_COUNT + 1):
+        customer = random.choice(customer_pool)
+        order_id = f"O{order_num:04d}"
+        order_date = date_for_order(order_num)
+        channel = CHANNELS[(order_num * 5) % len(CHANNELS)]
+        payment_method = PAYMENT_METHODS[(order_num * 3) % len(PAYMENT_METHODS)]
+        orders.append(
+            (
+                order_id,
+                customer[0],
+                order_date.isoformat(),
+                channel,
+                payment_method,
+            )
+        )
+
+        item_count = 1 + ((order_num * 11) % 3)
+        for item_idx in range(item_count):
+            product = product_rows[(order_num * 3 + item_idx * 5) % len(product_rows)]
+            weight = 1.0 + ((order_num + item_idx) % 5) / 4
+            line_blueprints.append(
+                {
+                    "order_id": order_id,
+                    "product_id": product[0],
+                    "weight": weight + product[4] / 400.0,
+                }
+            )
+
+    quantity_weights = [1.0 + ((i * 13) % 7) / 5 for i in range(len(line_blueprints))]
+    quantities = allocate_total(TARGET_UNITS, quantity_weights, minimum=1)
+
+    sales_weights = [bp["weight"] for bp in line_blueprints]
+    revenue_cents = allocate_total(TARGET_SALES_CENTS, sales_weights, minimum=500)
+    profit_cents = allocate_total(TARGET_PROFIT_CENTS, sales_weights, minimum=150)
+
+    order_items: list[tuple] = []
+    order_totals = defaultdict(lambda: {"sales": 0, "profit": 0, "qty": 0})
+
+    for idx, blueprint in enumerate(line_blueprints, start=1):
+        qty = quantities[idx - 1]
+        sales = revenue_cents[idx - 1]
+        profit = min(profit_cents[idx - 1], sales - 50)
+        unit_price = round(sales / qty / 100, 2)
+        order_items.append(
+            (
+                idx,
+                blueprint["order_id"],
+                blueprint["product_id"],
+                qty,
+                unit_price,
+                round(sales / 100, 2),
+                round(profit / 100, 2),
+            )
+        )
+        order_totals[blueprint["order_id"]]["sales"] += round(sales / 100, 2)
+        order_totals[blueprint["order_id"]]["profit"] += round(profit / 100, 2)
+        order_totals[blueprint["order_id"]]["qty"] += qty
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.executescript(
+        """
+        DROP TABLE IF EXISTS order_items;
+        DROP TABLE IF EXISTS orders;
+        DROP TABLE IF EXISTS products;
+        DROP TABLE IF EXISTS customers;
+
+        CREATE TABLE customers (
+            customer_id TEXT PRIMARY KEY,
+            customer_name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            state TEXT NOT NULL,
+            region TEXT NOT NULL,
+            segment TEXT NOT NULL,
+            loyalty_tier TEXT NOT NULL
+        );
+
+        CREATE TABLE products (
+            product_id TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            subcategory TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            list_price REAL NOT NULL
+        );
+
+        CREATE TABLE orders (
+            order_id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL,
+            order_date TEXT NOT NULL,
+            sales_channel TEXT NOT NULL,
+            payment_method TEXT NOT NULL,
+            FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+        );
+
+        CREATE TABLE order_items (
+            order_item_id INTEGER PRIMARY KEY,
+            order_id TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            unit_price REAL NOT NULL,
+            sales_amount REAL NOT NULL,
+            profit_amount REAL NOT NULL,
+            FOREIGN KEY (order_id) REFERENCES orders(order_id),
+            FOREIGN KEY (product_id) REFERENCES products(product_id)
+        );
+        """
+    )
+
+    cur.executemany("INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?, ?)", customer_rows)
+    cur.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?)", product_rows)
+    cur.executemany("INSERT INTO orders VALUES (?, ?, ?, ?, ?)", orders)
+    cur.executemany(
+        "INSERT INTO order_items VALUES (?, ?, ?, ?, ?, ?, ?)",
+        order_items,
+    )
+    conn.commit()
+
+    export_csv(
+        DATA_DIR / "customers.csv",
+        customer_rows,
+        ["customer_id", "customer_name", "city", "state", "region", "segment", "loyalty_tier"],
+    )
+    export_csv(
+        DATA_DIR / "products.csv",
+        product_rows,
+        ["product_id", "category", "subcategory", "product_name", "list_price"],
+    )
+    export_csv(
+        DATA_DIR / "orders.csv",
+        orders,
+        ["order_id", "customer_id", "order_date", "sales_channel", "payment_method"],
+    )
+    export_csv(
+        DATA_DIR / "order_items.csv",
+        order_items,
+        ["order_item_id", "order_id", "product_id", "quantity", "unit_price", "sales_amount", "profit_amount"],
+    )
+
+    summary = cur.execute(
+        """
+        SELECT
+            ROUND(SUM(sales_amount), 2),
+            ROUND(SUM(profit_amount), 2),
+            SUM(quantity),
+            COUNT(DISTINCT order_id)
+        FROM order_items
+        """
+    ).fetchone()
+    conn.close()
+
+    print(f"Database created at: {DB_PATH}")
+    print(f"Total sales: ${summary[0]:,.2f}")
+    print(f"Total profit: ${summary[1]:,.2f}")
+    print(f"Units sold: {summary[2]}")
+    print(f"Orders: {summary[3]}")
+
+
+if __name__ == "__main__":
+    main()
 
